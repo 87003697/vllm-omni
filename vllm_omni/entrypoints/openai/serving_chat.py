@@ -3005,6 +3005,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_params.guidance_scale = guidance_scale
             if true_cfg_scale is not None:
                 gen_params.true_cfg_scale = true_cfg_scale
+            true_cfg_scale_src = extra_body.get("true_cfg_scale_src")
+            if true_cfg_scale_src is not None:
+                gen_params.true_cfg_scale_src = true_cfg_scale_src
+            n_max = extra_body.get("n_max")
+            if n_max is not None:
+                gen_params.n_max = n_max
             if cfg_text_scale is not None:
                 gen_params.extra_args["cfg_text_scale"] = cfg_text_scale
             if cfg_img_scale is not None:

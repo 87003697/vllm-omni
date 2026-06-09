@@ -256,6 +256,8 @@ class OmniDiffusionSamplingParams:
     sigmas: list[float] | None = None
 
     true_cfg_scale: float | None = None  # qwen-image specific now
+    true_cfg_scale_src: float | None = None  # FlowEdit: source branch CFG scale
+    n_max: int | None = None  # FlowEdit: only apply edit in last n_max steps
 
     n_tokens: int | None = None
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)
