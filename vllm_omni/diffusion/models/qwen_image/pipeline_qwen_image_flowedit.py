@@ -315,7 +315,23 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         height = state.extra["vae_decode_height"]
         width = state.extra["vae_decode_width"]
 
-        return self._decode_latents(z_edit, height, width)
+        latents = self._unpack_latents(z_edit, height, width, self.vae_scale_factor)
+        latents = latents.to(self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+            1, self.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
+        latents = latents / latents_std + latents_mean
+        image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+
+        return DiffusionOutput(
+            output=image,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
 
     # ── Original forward path ──
 

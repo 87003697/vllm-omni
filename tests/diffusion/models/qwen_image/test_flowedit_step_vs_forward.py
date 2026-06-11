@@ -22,6 +22,7 @@ Usage on Koala:
 """
 
 import argparse
+import os
 import sys
 import time
 from types import SimpleNamespace
@@ -29,6 +30,32 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 from PIL import Image
+
+
+def init_single_gpu_distributed():
+    """Initialize vLLM distributed state for single-GPU testing."""
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "29500")
+
+    from vllm_omni.diffusion.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+    )
+
+    init_distributed_environment()
+    initialize_model_parallel(
+        data_parallel_size=1,
+        cfg_parallel_size=1,
+        sequence_parallel_size=1,
+        ulysses_degree=1,
+        ring_degree=1,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=1,
+    )
+
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.models.qwen_image.pipeline_qwen_image_flowedit import (
@@ -141,18 +168,28 @@ def main():
     print(f"  Device: {args.device}")
     print(f"{'=' * 60}\n")
 
+    # --- Initialize distributed state ---
+    print("Initializing distributed environment...")
+    init_single_gpu_distributed()
+
     # --- Load pipeline ---
     print("Loading pipeline...")
     od_config = OmniDiffusionConfig(
         model=args.model,
-        model_class="QwenImageFlowEditPipeline",
+        model_class_name="QwenImageFlowEditPipeline",
         parallel_config=DiffusionParallelConfig(),
         step_execution=True,
         max_num_seqs=1,
+        dtype=torch.bfloat16,
     )
 
-    pipeline = QwenImageFlowEditPipeline(od_config=od_config)
-    pipeline = pipeline.to(args.device)
+    from vllm.config import LoadConfig
+    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config=od_config)
+    pipeline = loader.load_model(load_device=args.device, device=torch.device(args.device))
+    # Ensure VAE is same dtype as text encoder (from_pretrained may load in fp32)
+    pipeline.vae = pipeline.vae.to(torch.bfloat16)
     print(f"  Pipeline loaded on {args.device}")
 
     # --- Prepare input ---
