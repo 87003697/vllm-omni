@@ -172,6 +172,36 @@ def make_grid(images: list, ncols: int = 3) -> Image.Image:
     return grid
 
 
+def make_comparison(ref: Image.Image, src: Image.Image, tgt: Image.Image,
+                    params: dict, cell: int = 512) -> Image.Image:
+    """Generate a single comparison image: ref | src | tgt with parameter annotations."""
+    from PIL import ImageDraw
+
+    header_h = 80
+    label_h = 30
+    w = cell * 3
+    h = header_h + cell + label_h
+    canvas = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    draw.text((10, 10), f'prompt: "{params["prompt"]}"', fill=(0, 0, 0))
+    draw.text((10, 40),
+              f'cfg_tgt={params["cfg_tgt"]}  cfg_src={params["cfg_src"]}  '
+              f'n_max={params["n_max"]}  steps={params["steps"]}',
+              fill=(80, 80, 80))
+
+    canvas.paste(ref.resize((cell, cell)), (0, header_h))
+    canvas.paste(src.resize((cell, cell)), (cell, header_h))
+    canvas.paste(tgt.resize((cell, cell)), (cell * 2, header_h))
+
+    for i, label in enumerate(["ref", "src", "tgt"]):
+        tw = draw.textlength(label)
+        draw.text((cell * i + (cell - tw) // 2, header_h + cell + 5),
+                  label, fill=(100, 100, 100))
+
+    return canvas
+
+
 def main():
     args = parse_args()
     renders_dir = Path(args.renders)
@@ -329,21 +359,22 @@ def main():
         writer.writeheader()
         writer.writerows(all_results)
 
-    # Save visual grid (first sample: render | edited | condition per view)
-    if samples:
-        name = samples[0]
-        grid_images = []
-        condition = Image.open(renders_dir / "conditions" / f"{name}.png").convert("RGB")
-        for vi in range(min(n_views, 4)):
-            render_img = Image.open(renders_dir / "renders" / name / f"v{vi}.png").convert("RGB")
-            edited_path = edited_dir / name / f"v{vi}.png"
-            if edited_path.exists():
-                edited_img = Image.open(edited_path).convert("RGB")
-                grid_images.extend([render_img, edited_img, condition])
-        if grid_images:
-            grid = make_grid(grid_images, ncols=3)
-            grid.save(output_dir / "grid.png")
-            print(f"Grid saved to {output_dir / 'grid.png'}")
+    # Save per-view comparison images: ref | src | tgt
+    comp_dir = output_dir / "comparisons"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    params = summary["params"]
+    for name in samples:
+        ref = Image.open(renders_dir / "conditions" / f"{name}.png").convert("RGB")
+        for vi in range(n_views):
+            src_path = renders_dir / "renders" / name / f"v{vi}.png"
+            tgt_path = edited_dir / name / f"v{vi}.png"
+            if not tgt_path.exists():
+                continue
+            src = Image.open(src_path).convert("RGB")
+            tgt = Image.open(tgt_path).convert("RGB")
+            comp = make_comparison(ref, src, tgt, params)
+            comp.save(comp_dir / f"{name}_v{vi}.png")
+    print(f"Comparisons saved to {comp_dir}/ ({len(samples)} samples × {n_views} views)")
 
 
 if __name__ == "__main__":
