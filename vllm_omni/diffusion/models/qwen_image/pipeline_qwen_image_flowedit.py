@@ -54,9 +54,21 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
             negative_prompt = " "
 
         additional_info = first_prompt.get("additional_information", {}) if not isinstance(first_prompt, str) else {}
-        condition_images = additional_info["condition_images"]
-        vae_images = additional_info["vae_images"]
-        vae_image_sizes = additional_info["vae_image_sizes"]
+        condition_images = additional_info.get("condition_images", [])
+        vae_images = additional_info.get("vae_images", [])
+        vae_image_sizes = additional_info.get("vae_image_sizes", [])
+
+        if len(vae_images) < 2:
+            if OmniDiffusionRequest.is_dummy_run_request_id(state.request_id):
+                vae_images = vae_images + vae_images
+                vae_image_sizes = vae_image_sizes + vae_image_sizes
+                condition_images = condition_images + condition_images
+            else:
+                raise ValueError(
+                    "FlowEdit requires at least 2 images: image[0]=source, image[1:]=conditions. "
+                    f"Got {len(vae_images)} image(s)."
+                )
+
         height = sampling.height
         width = sampling.width
 
@@ -65,7 +77,7 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         guidance_scale = sampling.guidance_scale if sampling.guidance_scale_provided else 1.0
 
         self._guidance_scale = guidance_scale
-        self._attention_kwargs = self._attention_kwargs if hasattr(self, "_attention_kwargs") else {}
+        self._attention_kwargs = {}
         self._current_timestep = None
         self._interrupt = False
 
@@ -159,25 +171,25 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         # n_max trimming: only apply edit in last n_max steps
         if n_max < len(timesteps):
             timesteps = timesteps[-n_max:]
+        timesteps = timesteps.to(device=self.device)
 
         # Initial state
         z_edit = x_src.clone()
         output_slice = x_src.shape[1]
 
-        # Build first step's model_inputs
+        # Build first step's latents_tgt
         t0 = timesteps[0] / 1000.0
         latents_src = (1 - t0) * x_src + t0 * noise
         latents_tgt = z_edit + latents_src - x_src
-        model_input_tgt = torch.cat([latents_tgt, cond_latent], dim=1)
-        model_input_src = torch.cat([latents_src, cond_latent], dim=1)
 
         # Populate state
         state.prompt_embeds = prompt_embeds
         state.prompt_embeds_mask = prompt_embeds_mask
         state.negative_prompt_embeds = negative_prompt_embeds
         state.negative_prompt_embeds_mask = negative_prompt_embeds_mask
-        state.latents = model_input_tgt
-        state.sampling.image_latent = model_input_src
+        state.latents = latents_tgt
+        # image_latent stores ALL static data: [x_src, noise, cond_latent] concat on seq dim
+        state.sampling.image_latent = torch.cat([x_src, noise, cond_latent], dim=1)
         state.timesteps = timesteps
         state.step_index = 0
         state.do_true_cfg = True
@@ -189,19 +201,15 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         state.sampling.true_cfg_scale = cfg_scale_tgt
 
         # FlowEdit-specific state
-        state.extra["x_src"] = x_src
-        state.extra["noise"] = noise
-        state.extra["cond_latent"] = cond_latent
         state.extra["z_edit"] = z_edit
+        state.extra["output_slice"] = output_slice
         state.extra["cfg_scale_src"] = cfg_scale_src
         state.extra["cfg_scale_tgt"] = cfg_scale_tgt
-        state.extra["output_slice"] = output_slice
         state.extra["vae_decode_height"] = vh0
         state.extra["vae_decode_width"] = vw0
 
-        # Pipeline-level cfg_scale_src (used by denoise_step which only sees InputBatch)
+        # Pipeline-level (denoise_step only sees InputBatch, not state.extra)
         self._flowedit_cfg_scale_src = cfg_scale_src
-        self._flowedit_output_slice = output_slice
 
         return state
 
@@ -215,7 +223,7 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         if self.interrupt:
             return None
 
-        t = input_batch.timesteps
+        t = input_batch.timesteps[0]
         self._current_timestep = t
         self.transformer.do_true_cfg = input_batch.do_true_cfg
 
@@ -223,10 +231,22 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         cfg_scale_src = self._flowedit_cfg_scale_src
         do_cfg_src = cfg_scale_src != 1.0
         do_cfg_tgt = cfg_scale_tgt != 1.0
-        output_slice = self._flowedit_output_slice
 
-        model_input_tgt = input_batch.latents
-        model_input_src = input_batch.image_latents
+        # Split static image_latents: [x_src, noise, cond_latent]
+        static_latents = input_batch.image_latents
+        latents_tgt = input_batch.latents
+        output_slice = latents_tgt.shape[1]
+        x_src = static_latents[:, :output_slice, :]
+        noise = static_latents[:, output_slice:2 * output_slice, :]
+        cond_latent = static_latents[:, 2 * output_slice:, :]
+
+        # Compute latents_src from current timestep (0-d scalar promotes with bf16)
+        t_curr = t / 1000.0
+        latents_src = (1 - t_curr) * x_src + t_curr * noise
+
+        # Build full model inputs by appending cond_latent
+        model_input_tgt = torch.cat([latents_tgt, cond_latent], dim=1)
+        model_input_src = torch.cat([latents_src, cond_latent], dim=1)
 
         # Broadcast timestep
         t_for_model = t.expand(model_input_tgt.shape[0]).to(
@@ -277,7 +297,7 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         noise_pred: torch.Tensor,
         **kwargs: Any,
     ) -> None:
-        """Euler update z_edit, rebuild next step's model_inputs."""
+        """Euler update z_edit, rebuild next step's latents_tgt."""
         del kwargs
         if self.interrupt:
             return
@@ -294,14 +314,16 @@ class QwenImageFlowEditPipeline(QwenImageEditPlusPipeline):
         state.step_index += 1
 
         if state.step_index < state.total_steps:
-            x_src = state.extra["x_src"]
-            noise = state.extra["noise"]
-            cond_latent = state.extra["cond_latent"]
+            # Recover x_src from static image_latent
+            output_slice = state.extra["output_slice"]
+            x_src = state.sampling.image_latent[:, :output_slice, :]
+            noise = state.sampling.image_latent[:, output_slice:2 * output_slice, :]
+
             t_next = timesteps[state.step_index] / 1000.0
             latents_src = (1 - t_next) * x_src + t_next * noise
             latents_tgt = z_edit + latents_src - x_src
-            state.latents = torch.cat([latents_tgt, cond_latent], dim=1)
-            state.sampling.image_latent = torch.cat([latents_src, cond_latent], dim=1)
+            state.latents = latents_tgt
+            # state.sampling.image_latent is NOT updated — it's static
 
     def post_decode(
         self,
